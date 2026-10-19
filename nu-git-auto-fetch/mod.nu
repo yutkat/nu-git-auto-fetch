@@ -18,18 +18,21 @@ def pre-prompt-hooks []: nothing -> list {
 #
 # Adds a pre_prompt hook that, inside a git repository, starts `git fetch` as
 # a background job when the last fetch is older than the interval. Running it
-# again replaces the previous hook instead of adding another one.
+# again replaces the previous hook and trusted directories instead of adding
+# to them.
 export def --env enable [
     --interval: duration # Minimum time between fetches of a repository (default: 5min)
+    --trusted: list<path> # Fetch only inside these directories (default: everywhere)
 ]: nothing -> nothing {
     let interval = $interval | default $DEFAULT_INTERVAL
     if $interval <= 0sec {
         error make {msg: $"interval must be positive, got ($interval)"}
     }
+    let trusted = $trusted | default [] | each {|p| $p | path expand }
     let others = pre-prompt-hooks | where {|h| not ($h | is-ours) }
     let hook = {code: {|| check $env.PWD | ignore }} | insert $MARKER true
     $env.config.hooks.pre_prompt = $others ++ [$hook]
-    $env.__NU_GIT_AUTO_FETCH = {enabled: true, interval: $interval, attempts: ((state).attempts? | default {})}
+    $env.__NU_GIT_AUTO_FETCH = {enabled: true, interval: $interval, trusted: $trusted, attempts: ((state).attempts? | default {})}
 }
 
 # Disable background fetching and remove the hook enable added.
@@ -54,6 +57,7 @@ export def status []: nothing -> record {
     {
         enabled: $st.enabled
         interval: ($st.interval? | default null)
+        trusted: ($st.trusted? | default [])
         hooks: (pre-prompt-hooks | where {|h| $h | is-ours } | length)
         repository: ($repo.common_dir? | default null)
         last_fetch: $last

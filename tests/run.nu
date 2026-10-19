@@ -18,6 +18,7 @@ $env.GIT_AUTHOR_NAME = "test"
 $env.GIT_AUTHOR_EMAIL = "test@example.com"
 $env.GIT_COMMITTER_NAME = "test"
 $env.GIT_COMMITTER_EMAIL = "test@example.com"
+hide-env -i GIT_SSH_COMMAND GIT_ALLOW_PROTOCOL
 
 def ours []: list -> list { where {|h| $h | is-ours } }
 
@@ -37,9 +38,16 @@ def fixture []: nothing -> record {
     {root: $root, up: $up, clone: $clone}
 }
 
-# Make every fetch from `clone` take at least `seconds`.
+# Make every fetch from `clone` take at least `seconds`: origin becomes an
+# ssh:// URL, and a fake ssh sleeps, then runs upload-pack locally.
 def slow-remote [clone: path, seconds: int]: nothing -> nothing {
-    ^git -C $clone config remote.origin.uploadpack $"sleep ($seconds); git-upload-pack"
+    let up = ^git -C $clone remote get-url origin | str trim
+    let ssh = $clone | path dirname | path join slow-ssh
+    # Git passes the remote command (`git-upload-pack '<path>'`) last.
+    $"sleep ($seconds)\nfor last; do :; done\nexec sh -c \"$last\"\n" | save -f $ssh
+    ^git -C $clone config core.sshCommand $"sh '($ssh)'"
+    ^git -C $clone config ssh.variant ssh
+    ^git -C $clone remote set-url origin $"ssh://localhost($up)"
 }
 
 def fetch-jobs []: nothing -> list {
@@ -89,7 +97,16 @@ def "test only marked records are ours" [] {
 def "test fetch never prompts" [] {
     assert equal $FETCH_ENV.GIT_TERMINAL_PROMPT "0"
     assert equal $FETCH_ENV.GIT_ASKPASS ""
-    assert equal $FETCH_ENV.GIT_SSH_COMMAND "ssh -o BatchMode=yes"
+    assert equal $FETCH_ENV.GCM_INTERACTIVE "never"
+}
+
+def "test default ssh command is batch mode ssh" [] {
+    assert equal (ssh-command) "ssh -o BatchMode=yes"
+    assert equal (ssh-command "") "ssh -o BatchMode=yes"
+}
+
+def "test a user ssh command is kept with batch mode appended" [] {
+    assert equal (ssh-command "ssh -i ~/.ssh/work") "ssh -i ~/.ssh/work -o BatchMode=yes"
 }
 
 # --- repository detection ---------------------------------------------------
@@ -151,6 +168,55 @@ def "test worktrees see fetches of the main worktree" [] {
     rm -r $f.root
 }
 
+def --env "test core.sshCommand is used without GIT_SSH_COMMAND" [] {
+    let f = fixture
+    hide-env -i GIT_SSH_COMMAND
+    assert equal (user-ssh-command $f.clone) null
+    assert equal (ssh-command (user-ssh-command $f.clone)) "ssh -o BatchMode=yes"
+    ^git -C $f.clone config core.sshCommand "ssh -i key"
+    assert equal (user-ssh-command $f.clone) "ssh -i key"
+    $env.GIT_SSH_COMMAND = ""
+    assert equal (user-ssh-command $f.clone) "ssh -i key" "an empty GIT_SSH_COMMAND is ignored"
+    rm -r $f.root
+}
+
+def --env "test GIT_SSH_COMMAND wins over core.sshCommand" [] {
+    let f = fixture
+    ^git -C $f.clone config core.sshCommand "ssh -i key"
+    $env.GIT_SSH_COMMAND = "ssh -i other"
+    assert equal (user-ssh-command $f.clone) "ssh -i other"
+    rm -r $f.root
+}
+
+def "test fetch args override repository commands" [] {
+    assert equal (fetch-args /r) [
+        -C /r -c core.hooksPath=/dev/null -c core.fsmonitor=false
+        fetch --quiet --no-all --no-recurse-submodules --upload-pack git-upload-pack
+    ]
+}
+
+def --env "test fetch env restricts protocols" [] {
+    hide-env -i GIT_ALLOW_PROTOCOL
+    let e = fetch-env
+    assert equal $e.GIT_ALLOW_PROTOCOL "file:http:https:ssh"
+    assert equal $e.GIT_SSH_COMMAND "ssh -o BatchMode=yes"
+    assert equal $e.GCM_INTERACTIVE "never"
+    assert equal (fetch-env "ssh -i key" | get GIT_SSH_COMMAND) "ssh -i key -o BatchMode=yes"
+}
+
+def --env "test fetch env keeps a user GIT_ALLOW_PROTOCOL" [] {
+    $env.GIT_ALLOW_PROTOCOL = "https"
+    assert equal (fetch-env | get GIT_ALLOW_PROTOCOL) "https"
+}
+
+def "test trusted directories match by path components" [] {
+    assert (is-trusted /home/u/src [])
+    assert (is-trusted /home/u/src [/home/u/src])
+    assert (is-trusted /home/u/src/a/b [/home/u/work /home/u/src])
+    assert not (is-trusted /home/u/src2 [/home/u/src])
+    assert not (is-trusted /home/u [/home/u/src])
+}
+
 # --- the hook body ----------------------------------------------------------
 
 def --env "test check does nothing outside a repository" [] {
@@ -171,6 +237,79 @@ def --env "test check fetches a never fetched repository in the background" [] {
     assert equal (fetch-jobs | get description) [$"($JOB_PREFIX)($f.clone | path join .git)"]
     wait-fetches
     assert equal (rev $f.clone origin/HEAD) (rev $f.up HEAD)
+    rm -r $f.root
+}
+
+def --env "test the fetch runs the configured ssh command in batch mode" [] {
+    let f = fixture
+    hide-env -i GIT_SSH_COMMAND
+    let log = $f.root | path join ssh.log
+    # A fake ssh that records its arguments; the fetch itself then fails.
+    ^git -C $f.clone config core.sshCommand $"printf '%s\\n' >'($log)'"
+    ^git -C $f.clone config ssh.variant ssh
+    ^git -C $f.clone remote set-url origin ssh://example.invalid/repo
+    check $f.clone
+    wait-fetches
+    let args = open --raw $log | lines
+    assert equal ($args | take 2) [-o BatchMode=yes]
+    assert ("example.invalid" in $args)
+    rm -r $f.root
+}
+
+def --env "test the fetch runs no hooks nor repository uploadpack" [] {
+    let f = fixture
+    commit $f.up
+    let hook_ran = $f.root | path join hook-ran
+    let uploadpack_ran = $f.root | path join uploadpack-ran
+    let hook = $f.clone | path join .git hooks reference-transaction
+    $"#!/bin/sh\ntouch '($hook_ran)'\n" | save -f $hook
+    chmod +x $hook
+    ^git -C $f.clone config remote.origin.uploadpack $"touch '($uploadpack_ran)'; git-upload-pack"
+    # fetch.all makes git fetch each remote in a child process.
+    ^git -C $f.clone remote add second $f.up
+    ^git -C $f.clone config remote.second.uploadpack $"touch '($uploadpack_ran)2'; git-upload-pack"
+    ^git -C $f.clone config fetch.all true
+    check $f.clone
+    wait-fetches
+    assert equal (rev $f.clone origin/HEAD) (rev $f.up HEAD) "the fetch succeeds"
+    assert not ($hook_ran | path exists) "hook ran"
+    assert not ($uploadpack_ran | path exists) "uploadpack ran"
+    assert not ($"($uploadpack_ran)2" | path exists) "uploadpack of a second remote ran"
+    # A plain fetch runs both, so the fixture is effective.
+    commit $f.up
+    ^git -C $f.clone fetch --quiet
+    assert ($hook_ran | path exists)
+    assert ($uploadpack_ran | path exists)
+    assert ($"($uploadpack_ran)2" | path exists)
+    rm -r $f.root
+}
+
+def --env "test the fetch refuses the ext transport" [] {
+    let f = fixture
+    let ran = $f.root | path join ext-ran
+    ^git -C $f.clone config protocol.ext.allow always
+    ^git -C $f.clone remote set-url origin $"ext::touch ($ran)"
+    check $f.clone
+    wait-fetches
+    assert not ($ran | path exists)
+    try { ^git -C $f.clone fetch --quiet o+e> /dev/null }
+    assert ($ran | path exists) "a plain fetch runs it, so the fixture is effective"
+    rm -r $f.root
+}
+
+def --env "test check skips directories outside the trusted ones" [] {
+    let f = fixture
+    let src = $f.root | path join src
+    let src2 = $f.root | path join src2
+    mkdir $src
+    mv $f.clone $src2
+    nu-git-auto-fetch enable --trusted [$src]
+    assert equal (check $src2) null "a sibling with the same prefix is not trusted"
+    assert equal (fetch-jobs | length) 0
+    assert equal ($env.__NU_GIT_AUTO_FETCH.attempts | columns) []
+    mv $src2 ($src | path join clone)
+    assert ((check ($src | path join clone)) != null)
+    wait-fetches
     rm -r $f.root
 }
 
@@ -298,6 +437,19 @@ def --env "test the installed hook runs the check" [] {
     rm -r $f.root
 }
 
+def --env "test enable stores and replaces trusted directories" [] {
+    let dir = mktemp -d
+    cd $dir
+    nu-git-auto-fetch enable --trusted [a ~/b]
+    assert equal (nu-git-auto-fetch status | get trusted) [($dir | path join a) ($nu.home-dir | path join b)]
+    nu-git-auto-fetch enable --trusted [c]
+    assert equal (nu-git-auto-fetch status | get trusted) [($dir | path join c)]
+    nu-git-auto-fetch enable
+    assert equal (nu-git-auto-fetch status | get trusted) []
+    cd ($dir | path dirname)
+    rm -r $dir
+}
+
 def --env "test disable removes only its hook" [] {
     $env.config.hooks.pre_prompt = [(user-hook)]
     let before = $env.config.hooks.pre_prompt
@@ -349,14 +501,26 @@ const TESTS = [
     "test a recent attempt postpones the fetch"
     "test only marked records are ours"
     "test fetch never prompts"
+    "test default ssh command is batch mode ssh"
+    "test a user ssh command is kept with batch mode appended"
     "test no repository outside git"
     "test repository dirs are absolute"
     "test linked worktree has its own git dir and shares the common dir"
     "test submodule is its own repository"
     "test last fetch is null before the first fetch"
     "test worktrees see fetches of the main worktree"
+    "test core.sshCommand is used without GIT_SSH_COMMAND"
+    "test GIT_SSH_COMMAND wins over core.sshCommand"
+    "test fetch args override repository commands"
+    "test fetch env restricts protocols"
+    "test fetch env keeps a user GIT_ALLOW_PROTOCOL"
+    "test trusted directories match by path components"
     "test check does nothing outside a repository"
     "test check fetches a never fetched repository in the background"
+    "test the fetch runs the configured ssh command in batch mode"
+    "test the fetch runs no hooks nor repository uploadpack"
+    "test the fetch refuses the ext transport"
+    "test check skips directories outside the trusted ones"
     "test check does not start a second fetch for a running one"
     "test check does not fetch again within the interval"
     "test a fetch in another worktree counts"
@@ -367,6 +531,7 @@ const TESTS = [
     "test enable installs one marked pre_prompt hook"
     "test enable is idempotent"
     "test enable rejects a non-positive interval without changes"
+    "test enable stores and replaces trusted directories"
     "test the installed hook runs the check"
     "test disable removes only its hook"
     "test disable keeps hooks the user added after enable"
@@ -382,14 +547,26 @@ def --env run-test [name: string]: nothing -> any {
             "test a recent attempt postpones the fetch" => { test a recent attempt postpones the fetch }
             "test only marked records are ours" => { test only marked records are ours }
             "test fetch never prompts" => { test fetch never prompts }
+            "test default ssh command is batch mode ssh" => { test default ssh command is batch mode ssh }
+            "test a user ssh command is kept with batch mode appended" => { test a user ssh command is kept with batch mode appended }
             "test no repository outside git" => { test no repository outside git }
             "test repository dirs are absolute" => { test repository dirs are absolute }
             "test linked worktree has its own git dir and shares the common dir" => { test linked worktree has its own git dir and shares the common dir }
             "test submodule is its own repository" => { test submodule is its own repository }
             "test last fetch is null before the first fetch" => { test last fetch is null before the first fetch }
             "test worktrees see fetches of the main worktree" => { test worktrees see fetches of the main worktree }
+            "test core.sshCommand is used without GIT_SSH_COMMAND" => { test core.sshCommand is used without GIT_SSH_COMMAND }
+            "test GIT_SSH_COMMAND wins over core.sshCommand" => { test GIT_SSH_COMMAND wins over core.sshCommand }
+            "test fetch args override repository commands" => { test fetch args override repository commands }
+            "test fetch env restricts protocols" => { test fetch env restricts protocols }
+            "test fetch env keeps a user GIT_ALLOW_PROTOCOL" => { test fetch env keeps a user GIT_ALLOW_PROTOCOL }
+            "test trusted directories match by path components" => { test trusted directories match by path components }
             "test check does nothing outside a repository" => { test check does nothing outside a repository }
             "test check fetches a never fetched repository in the background" => { test check fetches a never fetched repository in the background }
+            "test the fetch runs the configured ssh command in batch mode" => { test the fetch runs the configured ssh command in batch mode }
+            "test the fetch runs no hooks nor repository uploadpack" => { test the fetch runs no hooks nor repository uploadpack }
+            "test the fetch refuses the ext transport" => { test the fetch refuses the ext transport }
+            "test check skips directories outside the trusted ones" => { test check skips directories outside the trusted ones }
             "test check does not start a second fetch for a running one" => { test check does not start a second fetch for a running one }
             "test check does not fetch again within the interval" => { test check does not fetch again within the interval }
             "test a fetch in another worktree counts" => { test a fetch in another worktree counts }
@@ -400,6 +577,7 @@ def --env run-test [name: string]: nothing -> any {
             "test enable installs one marked pre_prompt hook" => { test enable installs one marked pre_prompt hook }
             "test enable is idempotent" => { test enable is idempotent }
             "test enable rejects a non-positive interval without changes" => { test enable rejects a non-positive interval without changes }
+            "test enable stores and replaces trusted directories" => { test enable stores and replaces trusted directories }
             "test the installed hook runs the check" => { test the installed hook runs the check }
             "test disable removes only its hook" => { test disable removes only its hook }
             "test disable keeps hooks the user added after enable" => { test disable keeps hooks the user added after enable }

@@ -33,13 +33,18 @@ nu --config examples/minimal-config.nu
 ## Usage
 
 ```nu
-nu-git-auto-fetch enable                   # fetch at most every 5 minutes per repository
-nu-git-auto-fetch enable --interval 10min  # choose the interval
-nu-git-auto-fetch status                   # state, and the current repository's last fetch
-nu-git-auto-fetch disable                  # remove the hook
+nu-git-auto-fetch enable                           # fetch at most every 5 minutes per repository
+nu-git-auto-fetch enable --interval 10min          # choose the interval
+nu-git-auto-fetch enable --trusted [~/src ~/work]  # fetch only inside these directories
+nu-git-auto-fetch status                           # state, and the current repository's last fetch
+nu-git-auto-fetch disable                          # remove the hook
 ```
 
-Running `enable` again replaces the previous hook without duplicates. The hook
+`--trusted` limits fetching to repositories in or below the given
+directories (compared by path components, so `~/src` does not cover
+`~/src2`); elsewhere the hook does not even run git. Without it, every
+repository is fetched. Running `enable` again replaces the previous hook and
+trusted directories without duplicates. The hook
 is a `{code: ...}` record marked with a `__nu_git_auto_fetch` field, so
 `disable` removes only that entry and keeps your own `pre_prompt` hooks,
 including ones added after `enable`.
@@ -47,7 +52,8 @@ including ones added after `enable`.
 ## How it works
 
 On each prompt the hook runs one `git rev-parse` (a few milliseconds; nothing
-else happens outside a repository) and starts a fetch when all of these hold:
+else happens outside a repository or outside the trusted directories) and
+starts a fetch when all of these hold:
 
 - `FETCH_HEAD` is missing or older than the interval. In a linked worktree, a
   fetch from the main worktree or any other worktree of the same repository
@@ -59,21 +65,61 @@ else happens outside a repository) and starts a fetch when all of these hold:
   `job list`, by the job's description). Worktrees of one repository share a
   single job; a submodule is a separate repository.
 
-The fetch runs `git fetch --quiet` in the current directory with output
-discarded, stdin closed, and an environment that never prompts:
+The fetch runs `git fetch --quiet` for the current branch's remote (never all
+remotes, even with `fetch.all`) and does not recurse into submodules; each
+submodule is fetched when you enter it. Output is discarded, stdin is closed,
+and the environment never prompts:
 
-| Variable              | Value                  | Effect                                                   |
-| --------------------- | ---------------------- | -------------------------------------------------------- |
-| `GIT_TERMINAL_PROMPT` | `0`                    | no username/password prompt on the terminal              |
-| `GIT_ASKPASS`         | empty                  | no graphical askpass program (`SSH_ASKPASS`)             |
-| `GIT_SSH_COMMAND`     | `ssh -o BatchMode=yes` | ssh fails instead of asking for a passphrase or host key |
+| Variable              | Value                    | Effect                                                   |
+| --------------------- | ------------------------ | -------------------------------------------------------- |
+| `GIT_TERMINAL_PROMPT` | `0`                      | no username/password prompt on the terminal              |
+| `GIT_ASKPASS`         | empty                    | no graphical askpass program (`SSH_ASKPASS`)             |
+| `GCM_INTERACTIVE`     | `never`                  | no Git Credential Manager dialog                         |
+| `GIT_SSH_COMMAND`     | `<ssh> -o BatchMode=yes` | ssh fails instead of asking for a passphrase or host key |
+| `GIT_ALLOW_PROTOCOL`  | `file:http:https:ssh`    | other transports (`git://`, `ext::`, ...) are refused    |
 
-Credential helpers and ssh-agent keys still work. Running fetches show up in
-`job list` as `nu-git-auto-fetch: <git dir>`, and `disable` lets them finish.
+`<ssh>` is your own ssh command: a non-empty `GIT_SSH_COMMAND`, else the
+repository's `core.sshCommand`, else `ssh`. A `GIT_ALLOW_PROTOCOL` you set
+yourself is kept instead. Credential helpers and ssh-agent
+keys still work. Running fetches show up in `job list` as
+`nu-git-auto-fetch: <git dir>`, and `disable` lets them finish.
+
+## Security
+
+Entering a repository runs `git fetch` in it, and git honors that
+repository's own `.git` directory, which can configure commands to run. An
+untrusted repository, such as one extracted from an archive, could run them
+when you `cd` into it. Prompts that run `git status` have the same kind of
+exposure, but a fetch widens it.
+
+The fetch therefore neutralizes the repository settings that git would run
+during it:
+
+- hooks, including `core.hooksPath` (`-c core.hooksPath=/dev/null`, which also
+  covers auto maintenance), and `core.fsmonitor`
+- `remote.<name>.uploadpack` (`--upload-pack git-upload-pack`)
+- non-standard transports, including `ext::` and `core.gitProxy` for `git://`
+  (`GIT_ALLOW_PROTOCOL`)
+- submodule recursion (`--no-recurse-submodules`)
+
+Still honored, because legitimate per-repository setups (such as one account
+per repository) depend on them: credential helpers (`credential.helper`) and
+`core.sshCommand` configured in the repository. Restrict fetching to
+directories you trust with `enable --trusted`, or run
+`nu-git-auto-fetch disable` before entering untrusted repositories.
 
 ## Known issues
 
-- `GIT_SSH_COMMAND` replaces a `core.sshCommand` you configured in git.
+- `GIT_SSH` (an ssh program path) is ignored during the fetch, because the
+  `GIT_SSH_COMMAND` set for it takes precedence. Use `GIT_SSH_COMMAND` or
+  `core.sshCommand` instead.
+- `-o BatchMode=yes` is appended to your ssh command, so a command that does
+  not accept ssh options (such as plink) fails to fetch.
+- A `remote.<name>.uploadpack` you configured is not used; the remote's
+  `git-upload-pack` must be on its default path.
+- With `GIT_ALLOW_PROTOCOL` unset, remotes using other transports (`git://`,
+  remote helpers such as `hg::`) are not fetched. Set `GIT_ALLOW_PROTOCOL`
+  yourself to allow them.
 - A fetch that hangs on the network is not killed; while it runs, no other
   fetch starts for that repository. Use `job kill` if needed.
 
