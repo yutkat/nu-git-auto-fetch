@@ -24,6 +24,20 @@ use /path/to/nu-git-auto-fetch/nu-git-auto-fetch
 nu-git-auto-fetch enable
 ```
 
+Or install it with [nupm](https://github.com/nushell/nupm) from the clone
+(`$env.NUPM_HOME/modules` must be in `$env.NU_LIB_DIRS`):
+
+```nu
+nupm install /path/to/nu-git-auto-fetch --path
+```
+
+and add to your `config.nu`:
+
+```nu
+use nu-git-auto-fetch
+nu-git-auto-fetch enable
+```
+
 `use` alone changes nothing. To try it without your own configuration:
 
 ```sh

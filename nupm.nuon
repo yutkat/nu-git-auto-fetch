@@ -1,0 +1,7 @@
+{
+    name: nu-git-auto-fetch
+    type: module
+    version: "0.1.0"
+    description: "Background `git fetch` from the Nushell prompt."
+    license: "LICENSE"
+}
