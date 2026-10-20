@@ -17,7 +17,13 @@ only installs a `pre_prompt` hook.
 
 ## Install
 
-Clone the repository, then add to your `config.nu`:
+Clone the repository:
+
+```sh
+git clone https://github.com/yutkat/nu-git-auto-fetch.git /path/to/nu-git-auto-fetch
+```
+
+then add to your `config.nu`:
 
 ```nu
 use /path/to/nu-git-auto-fetch/nu-git-auto-fetch
